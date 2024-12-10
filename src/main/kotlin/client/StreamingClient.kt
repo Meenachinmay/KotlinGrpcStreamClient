@@ -12,7 +12,6 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration.Companion.seconds
 import io.grpc.stub.StreamObserver
 import java.time.ZoneOffset
-import java.time.ZoneId
 import java.util.*
 
 class StreamingClient {
@@ -24,6 +23,7 @@ class StreamingClient {
         private const val BATCH_DELAY_MS = 500L       // Increased delay
         private const val MONITORING_INTERVAL_SECONDS = 5L
         private const val CHANNEL_SHUTDOWN_TIMEOUT_SECONDS = 10L
+        private const val MESSAGE_INTERVAL_MS = 5000L  // Interval for sending messages
     }
 
     // Initialize timezone explicitly
@@ -37,13 +37,14 @@ class StreamingClient {
     private val successfulConnections = AtomicInteger(0)
     private val failedConnections = AtomicInteger(0)
     private val receivedMessages = AtomicInteger(0)
+    private val sentMessages = AtomicInteger(0)
 
     // Use a fixed thread pool instead of virtual threads for better stability
     private val clientDispatcher = Executors.newFixedThreadPool(32).asCoroutineDispatcher()
     private val clientScope = CoroutineScope(clientDispatcher + SupervisorJob())
-
     // Thread-safe channel management
     private val channels = Collections.synchronizedList(mutableListOf<ManagedChannel>())
+    private val streamObservers = Collections.synchronizedList(mutableListOf<StreamObserver<StreamRequest>>())
 
     init {
         clientScope.launch {
@@ -106,8 +107,35 @@ class StreamingClient {
                     shutdown()
                 }
             }
+
+            // Start periodic message sending
+            startPeriodicMessageSending()
+
         } catch (e: Exception) {
             println("Error during connection creation: ${e.message}")
+        }
+    }
+
+    private fun startPeriodicMessageSending() {
+        clientScope.launch {
+            while (true) {
+                delay(MESSAGE_INTERVAL_MS)
+                // Randomly select some clients to send messages
+                val activeStreamObservers = streamObservers.toList()
+                activeStreamObservers.shuffled().take(100).forEach { observer ->
+                    try {
+                        val message = StreamRequest.newBuilder()
+                            .setClientId("client_${System.currentTimeMillis()}")
+                            .setConnectionTimestamp(System.currentTimeMillis())
+                            .setMessage("Hello from client at ${System.currentTimeMillis()}")
+                            .build()
+                        observer.onNext(message)
+                        sentMessages.incrementAndGet()
+                    } catch (e: Exception) {
+                        println("Error sending message: ${e.message}")
+                    }
+                }
+            }
         }
     }
 
@@ -141,8 +169,19 @@ class StreamingClient {
                 }
             }
 
+            // Create bidirectional stream
+            val requestObserver = stub.streamData(responseHandler)
+            streamObservers.add(requestObserver)
+
+            // Send initial message
+            val initialRequest = StreamRequest.newBuilder()
+                .setClientId("client_$connectionId")
+                .setConnectionTimestamp(System.currentTimeMillis())
+                .setMessage("Initial connection")
+                .build()
+
             withContext(Dispatchers.IO) {
-                stub.streamData(request, responseHandler)
+                requestObserver.onNext(initialRequest)
             }
 
             activeConnections.incrementAndGet()
